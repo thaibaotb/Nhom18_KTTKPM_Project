@@ -4,6 +4,7 @@ const bodyParser = require("body-parser");
 const { port } = require("./src/config/env");
 const connectDb = require("./src/config/db");
 const orderRoutes = require("./src/routes/order.routes");
+const webhookRoutes = require("./src/routes/webhook.routes");
 const errorHandler = require("./src/middlewares/errorHandler");
 
 const app = express();
@@ -19,7 +20,7 @@ app.use(
 app.use(bodyParser.urlencoded({ extended: true }));
 
 app.use("/orders", orderRoutes);
-app.use("/webhooks", orderRoutes);
+app.use("/webhooks", webhookRoutes);
 
 app.use(errorHandler);
 
