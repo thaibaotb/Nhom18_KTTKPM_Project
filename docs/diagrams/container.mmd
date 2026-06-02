@@ -1,0 +1,54 @@
+flowchart TB
+    subgraph Client Layer
+      FE[Frontend - React/Vite<br/>Port 5173]
+    end
+
+    subgraph ELPPA System Boundary
+      GW[API Gateway - Node/Express<br/>Port 3000]
+
+      AUTH[Auth Service<br/>Port 3001]
+      PRODUCT[Product Service<br/>Port 3002]
+      CART[Cart Service<br/>Port 3003]
+      ORDER[Order Service<br/>Port 3004]
+      CHAT[Chat Service<br/>Port 3005]
+      PAYMENT[Payment Service<br/>Port 5003]
+    end
+
+    subgraph Data Stores
+      PG[(PostgreSQL<br/>Auth data)]
+      MONGO[(MongoDB<br/>Product, Cart, Order, Chat, Payment)]
+      REDIS[(Redis<br/>Auth temporary data - OTP - pending registration)]
+    end
+
+    EXTPAY[PayOS]
+    EXTMAIL[SMTP]
+    EXTS3[S3 / Cloudinary]
+
+    FE -->|REST/HTTP + JWT| GW
+
+    GW --> AUTH
+    GW --> PRODUCT
+    GW --> CART
+    GW --> ORDER
+    GW --> CHAT
+    GW --> PAYMENT
+
+    AUTH --> PG
+    AUTH --> REDIS
+    AUTH --> EXTMAIL
+
+    PRODUCT --> MONGO
+    PRODUCT --> EXTS3
+
+    CART --> MONGO
+
+    ORDER --> MONGO
+    ORDER --> PAYMENT
+    ORDER --> PRODUCT
+    ORDER --> CART
+
+    CHAT --> MONGO
+
+    PAYMENT --> MONGO
+    PAYMENT --> EXTPAY
+    PAYMENT -->|Internal callback / outbox delivery| ORDER

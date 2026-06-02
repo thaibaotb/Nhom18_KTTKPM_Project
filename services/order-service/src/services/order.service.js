@@ -1,6 +1,7 @@
 const Order = require("../models/order.model");
 const { getProductById } = require("./productClient.service");
-const payos = require("./payos.service");
+const axios = require("axios");
+const { paymentServiceUrl } = require("../config/env");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 const eventBus = require("./eventBus.service");
@@ -76,6 +77,23 @@ async function retryWithBackoff(
   throw lastErr;
 }
 
+async function getPaymentStatusFromPaymentService(paymentId) {
+  if (!paymentId) return null;
+  if (!paymentServiceUrl) return null;
+  try {
+    const resp = await axios.get(
+      `${paymentServiceUrl.replace(/\/$/, "")}/payments/${encodeURIComponent(
+        String(paymentId),
+      )}`,
+      { timeout: 5000 },
+    );
+    return resp.data && resp.data.data ? resp.data.data : resp.data;
+  } catch (err) {
+    // treat as transient error for callers using retryWithBackoff
+    throw err;
+  }
+}
+
 function computeIdempotencyKey(userId, cart) {
   // Normalize cart items ordering to make idempotency key invariant to item order
   const items = (cart.items || []).map((it) => ({
@@ -90,6 +108,22 @@ function computeIdempotencyKey(userId, cart) {
   const hash = crypto.createHash("sha256");
   hash.update(JSON.stringify({ userId, items }));
   return hash.digest("hex");
+}
+
+function computeCartVersionFromKey(idempotencyKey) {
+  const hash = crypto.createHash("sha256");
+  hash.update(String(idempotencyKey || ""));
+  return parseInt(hash.digest("hex").slice(0, 8), 16);
+}
+
+function extractCheckoutUrl(order) {
+  if (!order) return null;
+  return (
+    (order.metadata && order.metadata.checkoutUrl) ||
+    order.checkoutUrl ||
+    order.paymentUrl ||
+    null
+  );
 }
 
 function paymentStatusToOrderStatus(status) {
@@ -108,10 +142,16 @@ function paymentStatusToOrderStatus(status) {
 }
 
 function resolveReturnUrl(returnUrl) {
-  const fallback =
-    process.env.PAYOS_RETURN_URL ||
+  const configuredBase =
     process.env.CLIENT_RETURN_URL ||
-    "http://localhost:3000/payments/return";
+    process.env.PAYOS_RETURN_URL ||
+    process.env.FRONTEND_URL ||
+    "";
+  const fallback = configuredBase
+    ? configuredBase
+        .replace(/\/$/, "")
+        .replace(/\/payments\/return$/i, "/payment/return")
+    : "http://localhost:5173/payment/return";
   return typeof returnUrl === "string" && returnUrl.trim()
     ? returnUrl.trim()
     : fallback;
@@ -120,9 +160,14 @@ function resolveReturnUrl(returnUrl) {
 function isValidCheckoutUrl(checkoutUrl) {
   if (typeof checkoutUrl !== "string" || !checkoutUrl.trim()) return false;
   const normalized = checkoutUrl.trim();
-  if (!/^https?:\/\//i.test(normalized)) return false;
-  if (normalized.includes("payos.example")) return false;
+  if (!/^https:\/\/pay\.payos\.vn\/web\/[a-f0-9]{32}\/?$/i.test(normalized)) {
+    return false;
+  }
   return true;
+}
+
+function normalizeCheckoutUrl(checkoutUrl) {
+  return isValidCheckoutUrl(checkoutUrl) ? String(checkoutUrl).trim() : null;
 }
 
 class OrderService {
@@ -138,37 +183,79 @@ class OrderService {
     return Array.isArray(allowed[from]) && allowed[from].includes(to);
   }
 
-  async _createPayment(order, returnUrl, correlationId = null) {
+  async _createPayment(order, returnUrl, correlationId = null, options = {}) {
     const finalReturnUrl = resolveReturnUrl(returnUrl);
-    // Ensure PayOS will redirect back with our internal order id so frontend can resolve it
+    // Ensure Payment Service will redirect back with our internal order id so frontend can resolve it
     const returnWithOrderId = `${finalReturnUrl}${finalReturnUrl.includes("?") ? "&" : "?"}orderId=${encodeURIComponent(
       String(order._id),
     )}`;
-    const paymentResp = await retryWithBackoff(
-      () => payos.createPayment(order, order.totalPrice, returnWithOrderId),
-      {
-        retries: 3,
-        baseDelay: 300,
-        onRetry: (attempt, err) =>
-          log("warn", "checkout:payment-retry", {
-            orderId: order._id.toString(),
-            attempt,
-            error: err.message,
-            correlationId,
-          }),
-      },
-    );
 
-    const paymentId = paymentResp.paymentId || paymentResp.paymentLinkId;
+    const payload = {
+      orderId: String(order._id),
+      amount: Math.round(order.totalPrice || 0),
+      description: `Order ${order._id}`,
+      orderCode: Number.parseInt(
+        `${Date.now().toString().slice(-6)}${crypto.randomInt(0, 100).toString().padStart(2, "0")}`,
+        10,
+      ),
+      returnUrl: returnWithOrderId,
+    };
+
+    const createPayment = async () => {
+      if (!paymentServiceUrl) {
+        throw new Error("Payment service URL not configured");
+      }
+      const resp = await axios.post(
+        `${paymentServiceUrl.replace(/\/$/, "")}/payments`,
+        { ...payload, forceRecreate: Boolean(options.forceRecreate) },
+        { timeout: 5000 },
+      );
+      return resp.data && resp.data.data ? resp.data.data : resp.data;
+    };
+
+    const axiosCall = async (payload) => {
+      return axios.post(
+        `${paymentServiceUrl.replace(/\/$/, "")}/payments`,
+        payload,
+        { timeout: 5000 },
+      );
+    };
+
+    const CircuitBreaker = require("../utils/circuitBreaker");
+    if (!this._paymentBreaker) {
+      this._paymentBreaker = new CircuitBreaker(
+        (payload) => axiosCall(payload),
+        { failureThreshold: 5, resetTimeout: 30000 },
+      );
+    }
+
+    const rawPaymentResp = await this._paymentBreaker.fire({
+      ...payload,
+      forceRecreate: Boolean(options.forceRecreate),
+    });
+    const paymentResp =
+      rawPaymentResp && rawPaymentResp.data && rawPaymentResp.data.data
+        ? rawPaymentResp.data.data
+        : rawPaymentResp && rawPaymentResp.data
+          ? rawPaymentResp.data
+          : rawPaymentResp;
+
+    const paymentId =
+      paymentResp._id || paymentResp.paymentId || paymentResp.paymentLinkId;
     const checkoutUrl =
       paymentResp.checkoutUrl ||
       paymentResp.checkout_url ||
       paymentResp.checkoutLink;
     if (!paymentId) {
-      throw new Error("PayOS did not return paymentId");
+      throw new Error("Payment Service did not return paymentId");
     }
 
-    return { paymentId, checkoutUrl, returnUrl: returnWithOrderId };
+    return {
+      paymentId,
+      checkoutUrl,
+      returnUrl: returnWithOrderId,
+      amount: paymentResp.amount,
+    };
   }
 
   async _claimCartClear(orderId) {
@@ -246,8 +333,9 @@ class OrderService {
       });
     }
 
-    // cartVersion is kept for webhook side effects compatibility
-    const cartVersion = 0;
+    // Keep cartVersion deterministic per checkout snapshot so unique index
+    // collisions do not happen on every direct checkout request.
+    let cartVersion = computeCartVersionFromKey(idempotencyKey);
 
     const ensureCheckoutUrlForActiveOrder = async (existingOrder) => {
       const existingCheckoutUrl =
@@ -269,9 +357,14 @@ class OrderService {
           const desiredAmount = Math.round(existingOrder.totalPrice || 0);
 
           if (existingOrder.paymentId) {
-            const payInfo = await payos.getPaymentStatus(
+            const payInfo = await getPaymentStatusFromPaymentService(
               existingOrder.paymentId,
             );
+            const providerCheckoutUrl = isValidCheckoutUrl(
+              payInfo && payInfo.checkoutUrl,
+            )
+              ? String(payInfo.checkoutUrl).trim()
+              : null;
             if (
               typeof payInfo.amount !== "undefined" &&
               Number(payInfo.amount) !== Number(desiredAmount)
@@ -284,6 +377,18 @@ class OrderService {
                 expectedAmount: desiredAmount,
                 correlationId,
               });
+            } else if (
+              providerCheckoutUrl &&
+              providerCheckoutUrl !== existingCheckoutUrl
+            ) {
+              return {
+                order: existingOrder,
+                checkoutUrl: providerCheckoutUrl,
+                returnUrl:
+                  existingOrder.metadata && existingOrder.metadata.returnUrl
+                    ? existingOrder.metadata.returnUrl
+                    : resolveReturnUrl(returnUrl),
+              };
             } else {
               return {
                 order: existingOrder,
@@ -340,11 +445,16 @@ class OrderService {
         existingOrder,
         returnUrl,
         correlationId,
+        {
+          forceRecreate: !isValidCheckoutUrl(existingCheckoutUrl),
+        },
       );
       const finalReturnUrl = paymentResp.returnUrl;
       const nextCheckoutUrl =
-        paymentResp.checkoutUrl ||
-        (existingOrder.metadata && existingOrder.metadata.checkoutUrl) ||
+        normalizeCheckoutUrl(paymentResp.checkoutUrl) ||
+        normalizeCheckoutUrl(
+          existingOrder.metadata && existingOrder.metadata.checkoutUrl,
+        ) ||
         null;
       const nextPaymentId = paymentResp.paymentId || paymentResp.paymentLinkId;
       const nextPaymentAmount =
@@ -393,26 +503,113 @@ class OrderService {
             updatedOrder.metadata &&
             updatedOrder.metadata.checkoutUrl) ||
           nextCheckoutUrl,
+        paymentUrl:
+          (updatedOrder &&
+            updatedOrder.metadata &&
+            updatedOrder.metadata.checkoutUrl) ||
+          nextCheckoutUrl,
         returnUrl: finalReturnUrl,
       };
     };
 
-    // If an order with the same idempotencyKey exists, log it but continue
-    // to create a fresh checkout (force new payment link) to avoid returning
-    // an old/paid checkout. We will not attach the same idempotencyKey to the
-    // new order to avoid duplicate-key conflicts.
+    // If an order with the same idempotencyKey exists, return it instead of
+    // forcing a new checkout. The snapshot is already the same.
     let existingByIdempotency = null;
     if (idempotencyKey) {
       existingByIdempotency = await Order.findOne({ idempotencyKey });
       if (existingByIdempotency) {
-        log("info", "checkout:idempotent-hit-forced-new", {
+        if (
+          ["PAID", "FAILED", "CANCELLED", "COMPLETED", "SUCCESS"].includes(
+            existingByIdempotency.status,
+          )
+        ) {
+          log("info", "checkout:idempotency-terminal-order", {
+            userId,
+            orderId: existingByIdempotency._id.toString(),
+            existingStatus: existingByIdempotency.status,
+            correlationId,
+          });
+          idempotencyKey = `${idempotencyKey}:${Date.now()}`;
+          cartVersion = computeCartVersionFromKey(idempotencyKey);
+          existingByIdempotency = null;
+        }
+      }
+
+      if (existingByIdempotency) {
+        const resolved = await ensureCheckoutUrlForActiveOrder(
+          existingByIdempotency,
+        );
+        let checkoutUrl =
+          normalizeCheckoutUrl(resolved.checkoutUrl) ||
+          normalizeCheckoutUrl(extractCheckoutUrl(existingByIdempotency));
+
+        if (!checkoutUrl) {
+          const paymentResp = await this._createPayment(
+            existingByIdempotency,
+            returnUrl,
+            correlationId,
+            {
+              forceRecreate: true,
+            },
+          );
+          const finalReturnUrl = paymentResp.returnUrl;
+          checkoutUrl =
+            normalizeCheckoutUrl(paymentResp.checkoutUrl) ||
+            normalizeCheckoutUrl(paymentResp.checkout_url) ||
+            normalizeCheckoutUrl(paymentResp.checkoutLink) ||
+            null;
+          const nextPaymentId =
+            paymentResp.paymentId || paymentResp.paymentLinkId;
+          const nextPaymentAmount =
+            typeof paymentResp.amount !== "undefined"
+              ? paymentResp.amount
+              : null;
+
+          const updatedExisting = await Order.findOneAndUpdate(
+            { _id: existingByIdempotency._id },
+            {
+              $set: {
+                paymentId: nextPaymentId,
+                status: "WAITING_PAYMENT",
+                paymentAttemptedAt: new Date(),
+                paymentExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
+                metadata: Object.assign({}, existingByIdempotency.metadata || {}, {
+                  checkoutUrl,
+                  returnUrl: finalReturnUrl,
+                  paymentAmount: nextPaymentAmount,
+                }),
+              },
+            },
+            { new: true },
+          );
+
+          log("info", "checkout:idempotent-resumed", {
+            userId,
+            orderId: existingByIdempotency._id.toString(),
+            correlationId,
+          });
+
+          return {
+            orderId: existingByIdempotency._id.toString(),
+            checkoutUrl,
+            paymentUrl: checkoutUrl,
+            returnUrl: finalReturnUrl,
+            order: updatedExisting || existingByIdempotency,
+          };
+        }
+
+        log("info", "checkout:idempotent-hit", {
           userId,
           orderId: existingByIdempotency._id.toString(),
           correlationId,
         });
-        // Drop idempotencyKey for the new order to force creation of a new
-        // checkout instead of returning the existing one.
-        idempotencyKey = null;
+        return {
+          orderId: existingByIdempotency._id.toString(),
+          checkoutUrl,
+          paymentUrl: checkoutUrl,
+          returnUrl: resolved.returnUrl,
+          order: resolved.order,
+        };
       }
     }
 
@@ -679,18 +876,20 @@ class OrderService {
     let order = null;
     try {
       if (mongoose.Types.ObjectId.isValid(String(orderId))) {
-        order = await Order.findOne({ _id: orderId, userId });
+        const query = { _id: orderId };
+        if (userId) query.userId = userId;
+        order = await Order.findOne(query);
       } else {
         // fallback: match by paymentId, metadata.paymentId, metadata.orderCode, or idempotencyKey
-        order = await Order.findOne({
-          userId,
-          $or: [
-            { paymentId: String(orderId) },
-            { ["metadata.paymentId"]: String(orderId) },
-            { ["metadata.orderCode"]: String(orderId) },
-            { idempotencyKey: String(orderId) },
-          ],
-        });
+        const query = {};
+        if (userId) query.userId = userId;
+        query.$or = [
+          { paymentId: String(orderId) },
+          { ["metadata.paymentId"]: String(orderId) },
+          { ["metadata.orderCode"]: String(orderId) },
+          { idempotencyKey: String(orderId) },
+        ];
+        order = await Order.findOne(query);
       }
     } catch (err) {
       // in case of cast errors or others, fall through to not found
@@ -702,11 +901,13 @@ class OrderService {
       throw e;
     }
     // On-demand reconciliation: if order is WAITING_PAYMENT but we haven't
-    // processed PayOS webhook (e.g., webhooks not delivered), attempt to
+    // processed external payment webhook (e.g., webhooks not delivered), attempt to
     // verify payment status directly and mark PAID when appropriate.
     if (order.status === "WAITING_PAYMENT" && order.paymentId) {
       try {
-        const payInfo = await payos.getPaymentStatus(order.paymentId);
+        const payInfo = await getPaymentStatusFromPaymentService(
+          order.paymentId,
+        );
         const normalized = String(
           (payInfo && payInfo.status) || "",
         ).toLowerCase();
@@ -748,6 +949,18 @@ class OrderService {
   }
 
   async getMyOrders(userId) {
+    const orders = await Order.find({ userId }).sort({ createdAt: -1 }).lean();
+
+    await Promise.all(
+      orders.map(async (order) => {
+        if (order.status === "WAITING_PAYMENT" && order.paymentId) {
+          try {
+            await this.getOrderById(order._id, userId);
+          } catch (error) {}
+        }
+      }),
+    );
+
     return Order.find({ userId }).sort({ createdAt: -1 }).lean();
   }
 
@@ -755,270 +968,76 @@ class OrderService {
     return Order.find({}).sort({ createdAt: -1 }).lean();
   }
 
-  // Handle PayOS webhook
-  async handlePayOsWebhook(rawBody, signature, ctx = {}) {
-    const correlationId = ctx.correlationId || null;
-    const verified = payos.verifyWebhookSignature(rawBody, signature);
-    if (!verified) {
-      log("warn", "webhook:invalid-signature", { correlationId });
-      const e = new Error("Invalid signature");
-      e.statusCode = 401;
-      throw e;
-    }
-    let payload;
-    try {
-      payload = JSON.parse(rawBody.toString());
-    } catch (err) {
-      const e = new Error("Invalid payload");
-      e.statusCode = 400;
-      throw e;
+  async applyPaymentResult({ orderId, status, paymentId = null }) {
+    if (!orderId) {
+      const error = new Error("orderId is required");
+      error.statusCode = 400;
+      throw error;
     }
 
-    const { paymentId, orderId, status, webhookId } = payload;
-    log("info", "webhook:received", {
-      orderId,
-      paymentId,
-      status,
-      webhookId,
-      correlationId,
-    });
-
-    // Fetch canonical order record
-    const canonicalOrder = await Order.findById(orderId).lean();
-    if (!canonicalOrder) {
-      log("warn", "webhook:order-not-found", {
-        orderId,
-        paymentId,
-        correlationId,
-      });
-      const e = new Error("Order not found");
-      e.statusCode = 404;
-      throw e;
+    const normalizedStatus = String(status || "").toUpperCase();
+    if (!normalizedStatus) {
+      const error = new Error("status is required");
+      error.statusCode = 400;
+      throw error;
     }
 
-    // Verify payment with PayOS before acting on webhook
-    let paymentInfo = null;
-    try {
-      paymentInfo = await retryWithBackoff(
-        () => payos.getPaymentStatus(paymentId),
-        {
-          retries: 2,
-          baseDelay: 200,
+    const existing = await Order.findById(orderId);
+    if (!existing) {
+      const error = new Error("Order not found");
+      error.statusCode = 404;
+      throw error;
+    }
+
+    if (normalizedStatus === "PAID" || normalizedStatus === "SUCCESS") {
+      if (existing.status === "PAID" || existing.status === "COMPLETED") {
+        return existing;
+      }
+
+      const update = {
+        $set: {
+          status: "PAID",
         },
+        $inc: { lockVersion: 1 },
+      };
+
+      if (paymentId) {
+        update.$set.paymentId = String(paymentId);
+        update.$set.lastProcessedPaymentId = String(paymentId);
+        update.$addToSet = { processedPaymentIds: String(paymentId) };
+      }
+
+      const updated = await Order.findOneAndUpdate(
+        { _id: orderId, status: { $nin: ["PAID", "COMPLETED"] } },
+        update,
+        { new: true },
       );
-    } catch (err) {
-      log("error", "webhook:payos-status-failed", {
-        orderId,
-        paymentId,
-        error: err.message,
-        correlationId,
-      });
-      // don't mark paid if we cannot verify
-      throw err;
-    }
 
-    // Validate amount and intended order id
-    if (
-      (typeof paymentInfo.amount !== "undefined" &&
-        Number(paymentInfo.amount) !== Number(canonicalOrder.totalPrice)) ||
-      (paymentInfo.orderId && String(paymentInfo.orderId) !== String(orderId))
-    ) {
-      log("error", "webhook:payment-mismatch", {
-        orderId,
-        paymentId,
-        paymentAmount: paymentInfo.amount,
-        expectedAmount: canonicalOrder.totalPrice,
-        paymentOrderId: paymentInfo.orderId,
-        correlationId,
-      });
-      // do not mark order as PAID on mismatch
-      return canonicalOrder;
-    }
-
-    if (
-      webhookId &&
-      Array.isArray(canonicalOrder.processedWebhookIds) &&
-      canonicalOrder.processedWebhookIds.includes(webhookId)
-    ) {
-      log("warn", "webhook:duplicate", {
-        orderId,
-        paymentId,
-        webhookId,
-        correlationId,
-      });
+      const finalOrder = updated || (await Order.findById(orderId));
       try {
-        metrics.inc("webhook_replays");
-      } catch (e) {}
-      return canonicalOrder;
+        await this._publishCartClear(finalOrder);
+      } catch (error) {}
+      return finalOrder;
     }
 
-    // Prepare atomic update condition: must be WAITING_PAYMENT and paymentId not seen
-    const cond = {
-      _id: orderId,
-      status: "WAITING_PAYMENT",
-      processedPaymentIds: { $ne: paymentId },
-    };
-    if (webhookId) {
-      cond.processedWebhookIds = { $ne: webhookId };
+    if (normalizedStatus === "FAILED" || normalizedStatus === "CANCELLED") {
+      return Order.findOneAndUpdate(
+        { _id: orderId, status: { $nin: ["PAID", "COMPLETED"] } },
+        {
+          $set: {
+            status: "FAILED",
+            ...(paymentId ? { paymentId: String(paymentId) } : {}),
+          },
+          $inc: { lockVersion: 1 },
+        },
+        { new: true },
+      );
     }
 
-    const update = { $inc: { lockVersion: 1 } };
-    update.$addToSet = { processedPaymentIds: paymentId };
-    if (webhookId)
-      update.$addToSet = Object.assign(update.$addToSet || {}, {
-        processedWebhookIds: webhookId,
-      });
-
-    const normalizedWebhookStatus = String(status || "").toLowerCase();
-    const normalizedPaymentStatus = String(
-      (paymentInfo && paymentInfo.status) || "",
-    ).toLowerCase();
-    const canonicalStatus = paymentStatusToOrderStatus(
-      normalizedPaymentStatus || normalizedWebhookStatus,
-    );
-
-    if (canonicalStatus === "PAID") {
-      if (
-        Number(canonicalOrder.totalPrice) !== Number(paymentInfo.amount) ||
-        String(paymentInfo.orderId) !== String(orderId)
-      ) {
-        log("error", "webhook:payment-mismatch", {
-          orderId,
-          paymentId,
-          paymentAmount: paymentInfo.amount,
-          expectedAmount: canonicalOrder.totalPrice,
-          paymentOrderId: paymentInfo.orderId,
-          correlationId,
-        });
-        return canonicalOrder;
-      }
-
-      update.$set = Object.assign(update.$set || {}, {
-        status: "PAID",
-        paymentId,
-      });
-      const updated = await Order.findOneAndUpdate(cond, update, { new: true });
-      if (!updated) {
-        const current = await Order.findById(orderId).lean();
-        if (
-          current &&
-          current.processedPaymentIds &&
-          current.processedPaymentIds.includes(paymentId)
-        ) {
-          log("warn", "webhook:duplicate", {
-            orderId,
-            paymentId,
-            correlationId,
-          });
-          try {
-            metrics.inc("webhook_replays");
-          } catch (e) {}
-          return current;
-        }
-        log("warn", "webhook:invalid-transition", {
-          orderId,
-          paymentId,
-          currentStatus: current && current.status,
-          correlationId,
-        });
-        return current;
-      }
-
-      // Enqueue cart clearing via outbox to ensure idempotent side-effect and retries
-      try {
-        const claimed = await this._publishCartClear(updated);
-        if (claimed) {
-          log("info", "webhook:clear-cart-enqueued", {
-            orderId: claimed._id.toString(),
-            correlationId,
-          });
-        }
-      } catch (err) {
-        log("warn", "webhook:clear-cart-enqueue-failed", {
-          orderId: updated._id.toString(),
-          error: err.message,
-          correlationId,
-        });
-      }
-
-      log("info", "webhook:paid", { orderId, paymentId, correlationId });
-      try {
-        await retryWithBackoff(
-          () =>
-            eventBus.publish("OrderPaid", {
-              orderId,
-              paymentId,
-              correlationId,
-            }),
-          { retries: 2 },
-        );
-      } catch (e) {
-        log("warn", "webhook:event-publish-failed", {
-          orderId,
-          paymentId,
-          correlationId,
-          error: e.message,
-        });
-      }
-      return updated;
-    }
-
-    if (canonicalStatus === "FAILED") {
-      update.$set = Object.assign(update.$set || {}, {
-        status: "FAILED",
-        paymentId,
-      });
-      const updated = await Order.findOneAndUpdate(cond, update, { new: true });
-      if (!updated) {
-        const current = await Order.findById(orderId).lean();
-        if (
-          current &&
-          current.processedPaymentIds &&
-          current.processedPaymentIds.includes(paymentId)
-        ) {
-          log("warn", "webhook:duplicate", {
-            orderId,
-            paymentId,
-            correlationId,
-          });
-          try {
-            metrics.inc("webhook_replays");
-          } catch (e) {}
-          return current;
-        }
-        log("warn", "webhook:invalid-transition", {
-          orderId,
-          paymentId,
-          currentStatus: current && current.status,
-          correlationId,
-        });
-        return current;
-      }
-      log("info", "webhook:failed", { orderId, paymentId, correlationId });
-      try {
-        await retryWithBackoff(
-          () =>
-            eventBus.publish("OrderFailed", {
-              orderId,
-              paymentId,
-              correlationId,
-            }),
-          { retries: 2 },
-        );
-      } catch (e) {
-        log("warn", "webhook:event-publish-failed", {
-          orderId,
-          paymentId,
-          correlationId,
-          error: e.message,
-        });
-      }
-      return updated;
-    }
-
-    log("warn", "webhook:unknown-status", { orderId, status, correlationId });
-    return await Order.findById(orderId);
+    return existing;
   }
+
+  // External payment webhook handling removed from Order Service - handled by Payment Service
 
   // Reconcile waiting payments; processes in batches with cursor + delay to avoid overload.
   // Options: { batchSize, batchDelayMs, maxBatches, startAfterId, correlationId }
@@ -1064,12 +1083,12 @@ class OrderService {
           }
 
           const statusResp = await retryWithBackoff(
-            () => payos.getPaymentStatus(order.paymentId),
+            () => getPaymentStatusFromPaymentService(order.paymentId),
             {
               retries: 2,
               baseDelay: 300,
               onRetry: (a, err) =>
-                log("warn", "reconcile:payos-retry", {
+                log("warn", "reconcile:payment-service-retry", {
                   orderId: order._id.toString(),
                   attempt: a,
                   error: err.message,
@@ -1213,6 +1232,130 @@ class OrderService {
       }
     }
     return { expired: toExpire.length };
+  }
+
+  async cleanupStaleWaitingPayments(opts = {}) {
+    const {
+      batchSize = 100,
+      correlationId = null,
+      staleAfterMs = Number(process.env.PAYMENT_STALE_ORDER_MS || 15 * 60 * 1000),
+    } = opts;
+    const now = new Date();
+    const candidates = await Order.find({
+      status: { $in: ["PENDING", "WAITING_PAYMENT"] },
+    })
+      .sort({ createdAt: 1 })
+      .limit(batchSize)
+      .lean();
+
+    let refreshed = 0;
+    let expired = 0;
+
+    for (const order of candidates) {
+      try {
+        const paymentExpiresAt =
+          order.paymentExpiresAt && !Number.isNaN(Date.parse(order.paymentExpiresAt))
+            ? new Date(order.paymentExpiresAt)
+            : null;
+        const createdAt =
+          order.createdAt && !Number.isNaN(Date.parse(order.createdAt))
+            ? new Date(order.createdAt)
+            : now;
+        const isExpired = paymentExpiresAt
+          ? paymentExpiresAt.getTime() <= now.getTime()
+          : now.getTime() - createdAt.getTime() >= staleAfterMs;
+        const isStalePending =
+          order.status === "PENDING" &&
+          now.getTime() - createdAt.getTime() >= staleAfterMs;
+
+        let providerCheckoutUrl = null;
+        let paymentInfo = null;
+
+        if (!isExpired && !isStalePending && order.paymentId) {
+          try {
+            paymentInfo = await getPaymentStatusFromPaymentService(order.paymentId);
+            if (paymentInfo && isValidCheckoutUrl(paymentInfo.checkoutUrl)) {
+              providerCheckoutUrl = String(paymentInfo.checkoutUrl).trim();
+            }
+          } catch (error) {
+            log("warn", "cleanup:payment-lookup-failed", {
+              orderId: order._id.toString(),
+              paymentId: order.paymentId,
+              correlationId,
+              error: error.message,
+            });
+          }
+        }
+
+        if (providerCheckoutUrl && !isStalePending) {
+          const currentCheckoutUrl =
+            order.metadata && typeof order.metadata.checkoutUrl === "string"
+              ? order.metadata.checkoutUrl
+              : null;
+
+          if (currentCheckoutUrl !== providerCheckoutUrl) {
+            await Order.findOneAndUpdate(
+              { _id: order._id, status: "WAITING_PAYMENT" },
+              {
+                $set: {
+                  metadata: Object.assign({}, order.metadata || {}, {
+                    checkoutUrl: providerCheckoutUrl,
+                    paymentAmount:
+                      typeof paymentInfo.amount !== "undefined"
+                        ? paymentInfo.amount
+                        : order.totalPrice,
+                  }),
+                },
+              },
+            );
+            refreshed += 1;
+          }
+          continue;
+        }
+
+        await Order.findOneAndUpdate(
+          { _id: order._id, status: { $in: ["PENDING", "WAITING_PAYMENT"] } },
+          {
+            $set: { status: "FAILED" },
+            $unset: {
+              paymentId: "",
+              paymentExpiresAt: "",
+              metadata: "",
+            },
+            $inc: { lockVersion: 1 },
+          },
+        );
+
+        try {
+          await eventBus.publish("OrderFailed", {
+            orderId: order._id.toString(),
+            paymentId: order.paymentId,
+            correlationId,
+            reason: isExpired || isStalePending ? "payment_expired" : "stale_checkout_link",
+          });
+        } catch (error) {
+          log("warn", "cleanup:event-publish-failed", {
+            orderId: order._id.toString(),
+            error: error.message,
+            correlationId,
+          });
+        }
+        expired += 1;
+      } catch (error) {
+        log("error", "cleanup:error", {
+          orderId: order._id.toString(),
+          error: error.message,
+          correlationId,
+        });
+      }
+    }
+
+    log("info", "cleanup:done", {
+      refreshed,
+      expired,
+      correlationId,
+    });
+    return { refreshed, expired };
   }
 }
 

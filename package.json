@@ -9,7 +9,9 @@
     "dev:gateway": "npm run dev --workspace api-gateway",
     "start:gateway": "npm run start --workspace api-gateway",
     "dev:auth": "npm run dev --workspace auth-service",
-    "start:auth": "npm run start --workspace auth-service"
+    "start:auth": "npm run start --workspace auth-service",
+    "test:e2e": "node scripts/test-e2e.js",
+    "fake:webhook": "node scripts/fakeWebhook.js"
   },
   "dependencies": {
     "emoji-picker-react": "^4.19.1"

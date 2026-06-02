@@ -42,10 +42,24 @@ async function findAll(where = {}) {
   });
 }
 
+async function countByRole(role) {
+  return prisma.user.count({
+    where: { role }
+  });
+}
+
+async function deleteUser(id) {
+  return prisma.user.delete({
+    where: { id }
+  });
+}
+
 module.exports = {
   findByEmail,
   findById,
   findAll,
+  countByRole,
+  deleteUser,
   createUser,
   updateUser
 };

@@ -45,7 +45,7 @@ const Footer = () => {
           <div className="space-y-6">
             <Link to="/" className="text-2xl font-bold tracking-tight text-elppa-obsidian">ELPPA</Link>
             <p className="text-sm text-elppa-gray leading-relaxed">
-              Trải nghiệm công nghệ Apple tối giản và hiện đại. Chúng tôi mang đến những sản phẩm tốt nhất với dịch vụ tận tâm.
+              Trải nghiệm công nghệ tối giản và hiện đại. Chúng tôi mang đến những sản phẩm tốt nhất với dịch vụ tận tâm.
             </p>
             <div className="space-y-4">
               <div className="flex items-center gap-3 text-elppa-gray hover:text-elppa-obsidian transition-colors">

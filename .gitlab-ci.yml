@@ -1,0 +1,78 @@
+image: node:22-alpine
+
+stages:
+  - validate
+  - test
+  - build
+  - deploy
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+default:
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .npm/
+  before_script:
+    - npm install --cache .npm --prefer-offline --no-audit --no-fund
+
+variables:
+  NODE_ENV: test
+  npm_config_fund: "false"
+  npm_config_audit: "false"
+
+"syntax:check":
+  stage: validate
+  script:
+    - node --check services/api-gateway/server.js
+    - node --check services/auth-service/server.js
+    - node --check services/order-service/server.js
+    - node --check services/payment-service/server.js
+    - node --check services/chat-service/server.js
+    - node --check services/product-service/server.js
+
+"cart:test":
+  image: node:22
+  stage: test
+  script:
+    - npm run test --workspace cart-service
+
+"order:test":
+  image: node:22
+  stage: test
+  script:
+    - npm run test --workspace order-service
+
+"frontend:build":
+  stage: build
+  script:
+    - npm run build --workspace frontend
+  artifacts:
+    when: always
+    paths:
+      - frontend/dist/
+    expire_in: 7 days
+
+"cart:build":
+  stage: build
+  script:
+    - npm run build --workspace cart-service
+  artifacts:
+    when: always
+    paths:
+      - services/cart-service/dist/
+    expire_in: 7 days
+
+deploy_staging:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+    - when: never
+  script:
+    - "echo Add your staging deploy commands here"
+    - "echo Example: docker compose -f infra/docker-compose.yml up -d --build"

@@ -1,0 +1,16 @@
+flowchart LR
+    Customer[Customer / End User]
+    Admin[Admin]
+
+    ELPPA[(ELPPA E-Commerce System)]
+
+    PayOS[PayOS Payment Gateway]
+    SMTP[SMTP Email Service]
+    S3[Cloud Storage (AWS S3 / Cloudinary)]
+
+    Customer -->|Browse products, cart, checkout, track orders, chat| ELPPA
+    Admin -->|Manage products, categories, orders, users, support chat| ELPPA
+
+    ELPPA -->|Create payment link, verify payment status, receive webhook flow| PayOS
+    ELPPA -->|Send OTP / notifications / account email| SMTP
+    ELPPA -->|Upload and retrieve product images| S3

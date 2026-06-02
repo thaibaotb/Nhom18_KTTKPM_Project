@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check JS syntax
+        run: |
+          node --check services/api-gateway/server.js
+          node --check services/auth-service/server.js
+          node --check services/order-service/server.js
+          node --check services/payment-service/server.js
+          node --check services/chat-service/server.js
+          node --check services/product-service/server.js
+
+  test:
+    needs: syntax
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        workspace: [ "cart-service", "order-service" ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - name: Install dependencies (workspace)
+        run: npm install --prefer-offline --no-audit
+      - name: Run tests for ${{ matrix.workspace }}
+        run: npm run test --workspace ${{ matrix.workspace }}
+        env:
+          CI: true
+
+  build-frontend:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install frontend deps
+        run: npm install --workspace frontend --prefer-offline --no-audit
+      - name: Build frontend
+        run: npm run build --workspace frontend
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+  # Optional: deploy job (manual) - left as a placeholder so you can wire your registry/host
+  deploy_staging:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Manual placeholder
+        run: echo "Add deploy steps here (push image, SSH, kubectl, etc.)"
