@@ -33,100 +33,111 @@ class OrderCheckoutService {
     this.cartClient = cartClient;
   }
 
-  async createOrder(userId) {
+  async createOrder(userId, extraData = {}) {
     if (!userId || !String(userId).trim()) {
       throw new BadRequestException("userId is required");
     }
 
     console.log("[Checkout] Start", { userId });
 
-    let cart;
-    try {
-      cart = await this.cartClient.getCart(userId);
-      console.log("[Checkout] Cart fetched", {
-        userId,
-        cartVersion: cart?.version,
-        cartStatus: cart?.status,
-      });
-    } catch (error) {
-      console.log("[Checkout] Failure", {
-        userId,
-        reason: "cart_fetch_failed",
-        error: error.message,
-      });
-      throw error;
-    }
+    let itemsSnapshot;
+    let cartVersion = 0;
+    let isDirectItems = false;
 
-    if (!cart) {
-      console.log("[Checkout] Failure", {
-        userId,
-        reason: "cart_not_found",
-      });
-      throw new BadRequestException("Cart not found");
-    }
-    if (!Array.isArray(cart.items) || cart.items.length === 0) {
-      console.log("[Checkout] Failure", {
-        userId,
-        cartVersion: cart?.version,
-        reason: "cart_empty",
-      });
-      throw new BadRequestException("Cart is empty");
-    }
+    if (Array.isArray(extraData.items) && extraData.items.length > 0) {
+      itemsSnapshot = JSON.parse(JSON.stringify(extraData.items));
+      cartVersion = Date.now();
+      isDirectItems = true;
+    } else {
+      let cart;
+      try {
+        cart = await this.cartClient.getCart(userId);
+        console.log("[Checkout] Cart fetched", {
+          userId,
+          cartVersion: cart?.version,
+          cartStatus: cart?.status,
+        });
+      } catch (error) {
+        console.log("[Checkout] Failure", {
+          userId,
+          reason: "cart_fetch_failed",
+          error: error.message,
+        });
+        throw error;
+      }
 
-    if (cart.status !== "ACTIVE") {
-      console.log("[Checkout] Conflict", {
-        userId,
-        cartVersion: cart?.version,
-        reason: "cart_not_active",
-        cartStatus: cart.status,
-      });
-      throw new ConflictException("Checkout conflict");
-    }
+      if (!cart) {
+        console.log("[Checkout] Failure", {
+          userId,
+          reason: "cart_not_found",
+        });
+        throw new BadRequestException("Cart not found");
+      }
+      if (!Array.isArray(cart.items) || cart.items.length === 0) {
+        console.log("[Checkout] Failure", {
+          userId,
+          cartVersion: cart?.version,
+          reason: "cart_empty",
+        });
+        throw new BadRequestException("Cart is empty");
+      }
 
-    const cartVersion = Number(cart.version);
+      if (cart.status !== "ACTIVE") {
+        console.log("[Checkout] Conflict", {
+          userId,
+          cartVersion: cart?.version,
+          reason: "cart_not_active",
+          cartStatus: cart.status,
+        });
+        throw new ConflictException("Checkout conflict");
+      }
+
+      cartVersion = Number(cart.version);
+      itemsSnapshot = JSON.parse(JSON.stringify(cart.items));
+
+      let clearResult;
+      try {
+        clearResult = await this.cartClient.clearCart(userId, cart.version);
+      } catch (error) {
+        console.log("[Checkout] Conflict", {
+          userId,
+          cartVersion,
+          reason: "clear_cart_error",
+          error: error.message,
+        });
+        throw new ConflictException("Checkout conflict");
+      }
+      console.log("[Checkout] Cart cleared", {
+        userId,
+        cartVersion,
+        cleared: !!clearResult,
+      });
+
+      if (!clearResult) {
+        console.log("[Checkout] Conflict", {
+          userId,
+          cartVersion,
+          reason: "clear_cart_conflict",
+        });
+        throw new ConflictException("Checkout conflict");
+      }
+    }
 
     // Idempotency key is (userId, cartVersion). If already processed, return it.
-    const existingOrder = await this.orderModel.findOne({
-      userId,
-      cartVersion,
-    });
-    if (existingOrder) {
-      console.log("[Checkout] Idempotency hit", {
+    // Skip idempotency check for direct-items (COD) orders since each is unique.
+    if (!isDirectItems) {
+      const existingOrder = await this.orderModel.findOne({
         userId,
         cartVersion,
-        orderId: existingOrder._id,
       });
-      return existingOrder;
-    }
-
-    // Snapshot MUST be a deep clone before clearCart.
-    const itemsSnapshot = JSON.parse(JSON.stringify(cart.items));
-
-    let clearResult;
-    try {
-      clearResult = await this.cartClient.clearCart(userId, cart.version);
-    } catch (error) {
-      console.log("[Checkout] Conflict", {
-        userId,
-        cartVersion,
-        reason: "clear_cart_error",
-        error: error.message,
-      });
-      throw new ConflictException("Checkout conflict");
-    }
-    console.log("[Checkout] Cart cleared", {
-      userId,
-      cartVersion,
-      cleared: !!clearResult,
-    });
-
-    if (!clearResult) {
-      console.log("[Checkout] Conflict", {
-        userId,
-        cartVersion,
-        reason: "clear_cart_conflict",
-      });
-      throw new ConflictException("Checkout conflict");
+      if (existingOrder) {
+        console.log("[Checkout] Idempotency hit", {
+          userId,
+          cartVersion,
+          orderId: existingOrder._id,
+        });
+        return existingOrder;
+      }
     }
 
     const totalPrice = calculateTotalPrice(itemsSnapshot);
@@ -137,7 +148,14 @@ class OrderCheckoutService {
       totalPrice,
       status: "PENDING",
       cartVersion,
+      metadata: extraData.metadata || {},
     };
+
+    // COD / direct-items orders need a unique idempotencyKey to avoid
+    // E11000 duplicate key errors on the {userId, idempotencyKey} compound index.
+    if (isDirectItems) {
+      orderDocument.idempotencyKey = `cod-${userId}-${cartVersion}`;
+    }
 
     let createdOrder;
     try {

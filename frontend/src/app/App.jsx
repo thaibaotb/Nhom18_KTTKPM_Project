@@ -20,34 +20,61 @@ import EditProduct from '../pages/admin/EditProduct';
 import CategoryManagement from '../pages/admin/CategoryManagement';
 import OrderManagement from '../pages/admin/OrderManagement';
 import CustomerManagement from '../pages/admin/CustomerManagement';
+import AccountManagement from '../pages/admin/AccountManagement';
 import ReviewsManagement from '../pages/admin/ReviewsManagement';
 import Analytics from '../pages/admin/Analytics';
 import Settings from '../pages/admin/Settings';
 import ChatDashboard from '../pages/admin/ChatDashboard';
 import ChatWidget from '../components/common/ChatWidget';
 import ToastContainer from '../components/common/ToastContainer';
+import { useAuthStore } from '../store/useAuthStore';
 
 import '../admin.css'; // Tailwind & Admin Styles
+
+function CustomerRoute({ children }) {
+  const user = useAuthStore((state) => state.user);
+
+  if (user?.role === 'admin') {
+    return <Navigate to="/admin" replace />;
+  }
+
+  return children;
+}
+
+function AdminRoute({ children }) {
+  const user = useAuthStore((state) => state.user);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+
+  if (user?.role !== 'admin') {
+    return <Navigate to="/" replace />;
+  }
+
+  return children;
+}
 
 function App() {
   return (
     <>
       <Routes>
         {/* Customer Routes */}
-        <Route path="/" element={<Home />} />
-        <Route path="/login" element={<Login />} />
-        <Route path="/register" element={<Register />} />
-        <Route path="/forgot-password" element={<ForgotPassword />} />
-        <Route path="/account" element={<Account />} />
-        <Route path="/category/:brand" element={<CategoryPage />} />
-        <Route path="/support" element={<Support />} />
-        <Route path="/store" element={<Store />} />
-        <Route path="/product/:id" element={<ProductDetail />} />
-        <Route path="/payment/return" element={<PaymentReturn />} />
-        <Route path="/cart" element={<CartPage />} />
+        <Route path="/" element={<CustomerRoute><Home /></CustomerRoute>} />
+        <Route path="/login" element={<CustomerRoute><Login /></CustomerRoute>} />
+        <Route path="/register" element={<CustomerRoute><Register /></CustomerRoute>} />
+        <Route path="/forgot-password" element={<CustomerRoute><ForgotPassword /></CustomerRoute>} />
+        <Route path="/account" element={<CustomerRoute><Account /></CustomerRoute>} />
+        <Route path="/category/:brand" element={<CustomerRoute><CategoryPage /></CustomerRoute>} />
+        <Route path="/support" element={<CustomerRoute><Support /></CustomerRoute>} />
+        <Route path="/store" element={<CustomerRoute><Store /></CustomerRoute>} />
+        <Route path="/product/:id" element={<CustomerRoute><ProductDetail /></CustomerRoute>} />
+        <Route path="/payment/return" element={<CustomerRoute><PaymentReturn /></CustomerRoute>} />
+        <Route path="/cart" element={<CustomerRoute><CartPage /></CustomerRoute>} />
 
         {/* Admin Routes */}
-        <Route path="/admin" element={<AdminLayout />}>
+        <Route path="/admin" element={<AdminRoute><AdminLayout /></AdminRoute>}>
           <Route index element={<Dashboard />} />
           <Route path="products" element={<ProductManagement />} />
           <Route path="products/new" element={<AddProduct />} />
@@ -55,6 +82,7 @@ function App() {
           <Route path="categories" element={<CategoryManagement />} />
           <Route path="orders" element={<OrderManagement />} />
           <Route path="customers" element={<CustomerManagement />} />
+          <Route path="accounts" element={<AccountManagement />} />
           <Route path="chat" element={<ChatDashboard />} />
           <Route path="reviews" element={<ReviewsManagement />} />
           <Route path="analytics" element={<Analytics />} />

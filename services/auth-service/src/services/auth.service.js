@@ -189,6 +189,60 @@ async function getUsers(role) {
   return users.map(sanitizeUser);
 }
 
+async function updateUserRole(actor, userId, role) {
+  if (!actor || actor.role !== ROLES.ADMIN) {
+    throw createServiceError('Forbidden', 403);
+  }
+
+  if (!Object.values(ROLES).includes(role)) {
+    throw createServiceError('Role không hợp lệ', 400);
+  }
+
+  const user = await userRepository.findById(userId);
+  if (!user) {
+    throw createServiceError('Người dùng không tồn tại', 404);
+  }
+
+  if (actor.userId === userId && role !== ROLES.ADMIN) {
+    throw createServiceError('Không thể tự hạ quyền admin của chính mình', 400);
+  }
+
+  if (user.role === ROLES.ADMIN && role !== ROLES.ADMIN) {
+    const adminCount = await userRepository.countByRole(ROLES.ADMIN);
+    if (adminCount <= 1) {
+      throw createServiceError('Không thể hạ quyền admin cuối cùng', 400);
+    }
+  }
+
+  const updatedUser = await userRepository.updateUser(userId, { role });
+  return sanitizeUser(updatedUser);
+}
+
+async function deleteUser(actor, userId) {
+  if (!actor || actor.role !== ROLES.ADMIN) {
+    throw createServiceError('Forbidden', 403);
+  }
+
+  const user = await userRepository.findById(userId);
+  if (!user) {
+    throw createServiceError('Người dùng không tồn tại', 404);
+  }
+
+  if (actor.userId === userId) {
+    throw createServiceError('Không thể tự xóa tài khoản của chính mình', 400);
+  }
+
+  if (user.role === ROLES.ADMIN) {
+    const adminCount = await userRepository.countByRole(ROLES.ADMIN);
+    if (adminCount <= 1) {
+      throw createServiceError('Không thể xóa admin cuối cùng', 400);
+    }
+  }
+
+  await userRepository.deleteUser(userId);
+  return { id: userId };
+}
+
 module.exports = {
   register,
   login,
@@ -197,5 +251,7 @@ module.exports = {
   verifyOTP,
   verifyRegistration,
   updateProfile,
-  getUsers
+  getUsers,
+  updateUserRole,
+  deleteUser
 };

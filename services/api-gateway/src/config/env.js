@@ -3,6 +3,8 @@ const nodeEnv = process.env.NODE_ENV || "development";
 const authServiceUrl = process.env.AUTH_SERVICE_URL || "http://localhost:3001";
 const productServiceUrl =
   process.env.PRODUCT_SERVICE_URL || "http://localhost:3002";
+const aiAgentServiceUrl =
+  process.env.AI_AGENT_SERVICE_URL || "http://localhost:3010";
 const cartServiceUrl = process.env.CART_SERVICE_URL || "http://localhost:3003";
 const orderServiceUrl =
   process.env.ORDER_SERVICE_URL || "http://localhost:3004";
@@ -15,6 +17,7 @@ module.exports = {
   nodeEnv,
   authServiceUrl,
   productServiceUrl,
+  aiAgentServiceUrl,
   cartServiceUrl,
   orderServiceUrl,
   paymentServiceUrl,

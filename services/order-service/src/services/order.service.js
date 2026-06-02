@@ -110,6 +110,22 @@ function computeIdempotencyKey(userId, cart) {
   return hash.digest("hex");
 }
 
+function computeCartVersionFromKey(idempotencyKey) {
+  const hash = crypto.createHash("sha256");
+  hash.update(String(idempotencyKey || ""));
+  return parseInt(hash.digest("hex").slice(0, 8), 16);
+}
+
+function extractCheckoutUrl(order) {
+  if (!order) return null;
+  return (
+    (order.metadata && order.metadata.checkoutUrl) ||
+    order.checkoutUrl ||
+    order.paymentUrl ||
+    null
+  );
+}
+
 function paymentStatusToOrderStatus(status) {
   const normalized = String(status || "").toLowerCase();
   if (normalized === "success" || normalized === "paid") {
@@ -126,8 +142,16 @@ function paymentStatusToOrderStatus(status) {
 }
 
 function resolveReturnUrl(returnUrl) {
-  const fallback =
-    process.env.CLIENT_RETURN_URL || "http://localhost:3000/payments/return";
+  const configuredBase =
+    process.env.CLIENT_RETURN_URL ||
+    process.env.PAYOS_RETURN_URL ||
+    process.env.FRONTEND_URL ||
+    "";
+  const fallback = configuredBase
+    ? configuredBase
+        .replace(/\/$/, "")
+        .replace(/\/payments\/return$/i, "/payment/return")
+    : "http://localhost:5173/payment/return";
   return typeof returnUrl === "string" && returnUrl.trim()
     ? returnUrl.trim()
     : fallback;
@@ -136,9 +160,14 @@ function resolveReturnUrl(returnUrl) {
 function isValidCheckoutUrl(checkoutUrl) {
   if (typeof checkoutUrl !== "string" || !checkoutUrl.trim()) return false;
   const normalized = checkoutUrl.trim();
-  if (!/^https?:\/\//i.test(normalized)) return false;
-  if (normalized.includes("example-payment-provider")) return false;
+  if (!/^https:\/\/pay\.payos\.vn\/web\/[a-f0-9]{32}\/?$/i.test(normalized)) {
+    return false;
+  }
   return true;
+}
+
+function normalizeCheckoutUrl(checkoutUrl) {
+  return isValidCheckoutUrl(checkoutUrl) ? String(checkoutUrl).trim() : null;
 }
 
 class OrderService {
@@ -154,7 +183,7 @@ class OrderService {
     return Array.isArray(allowed[from]) && allowed[from].includes(to);
   }
 
-  async _createPayment(order, returnUrl, correlationId = null) {
+  async _createPayment(order, returnUrl, correlationId = null, options = {}) {
     const finalReturnUrl = resolveReturnUrl(returnUrl);
     // Ensure Payment Service will redirect back with our internal order id so frontend can resolve it
     const returnWithOrderId = `${finalReturnUrl}${finalReturnUrl.includes("?") ? "&" : "?"}orderId=${encodeURIComponent(
@@ -165,6 +194,11 @@ class OrderService {
       orderId: String(order._id),
       amount: Math.round(order.totalPrice || 0),
       description: `Order ${order._id}`,
+      orderCode: Number.parseInt(
+        `${Date.now().toString().slice(-6)}${crypto.randomInt(0, 100).toString().padStart(2, "0")}`,
+        10,
+      ),
+      returnUrl: returnWithOrderId,
     };
 
     const createPayment = async () => {
@@ -173,7 +207,7 @@ class OrderService {
       }
       const resp = await axios.post(
         `${paymentServiceUrl.replace(/\/$/, "")}/payments`,
-        payload,
+        { ...payload, forceRecreate: Boolean(options.forceRecreate) },
         { timeout: 5000 },
       );
       return resp.data && resp.data.data ? resp.data.data : resp.data;
@@ -195,7 +229,16 @@ class OrderService {
       );
     }
 
-    const paymentResp = await this._paymentBreaker.fire(payload);
+    const rawPaymentResp = await this._paymentBreaker.fire({
+      ...payload,
+      forceRecreate: Boolean(options.forceRecreate),
+    });
+    const paymentResp =
+      rawPaymentResp && rawPaymentResp.data && rawPaymentResp.data.data
+        ? rawPaymentResp.data.data
+        : rawPaymentResp && rawPaymentResp.data
+          ? rawPaymentResp.data
+          : rawPaymentResp;
 
     const paymentId =
       paymentResp._id || paymentResp.paymentId || paymentResp.paymentLinkId;
@@ -290,8 +333,9 @@ class OrderService {
       });
     }
 
-    // cartVersion is kept for webhook side effects compatibility
-    const cartVersion = 0;
+    // Keep cartVersion deterministic per checkout snapshot so unique index
+    // collisions do not happen on every direct checkout request.
+    let cartVersion = computeCartVersionFromKey(idempotencyKey);
 
     const ensureCheckoutUrlForActiveOrder = async (existingOrder) => {
       const existingCheckoutUrl =
@@ -316,6 +360,11 @@ class OrderService {
             const payInfo = await getPaymentStatusFromPaymentService(
               existingOrder.paymentId,
             );
+            const providerCheckoutUrl = isValidCheckoutUrl(
+              payInfo && payInfo.checkoutUrl,
+            )
+              ? String(payInfo.checkoutUrl).trim()
+              : null;
             if (
               typeof payInfo.amount !== "undefined" &&
               Number(payInfo.amount) !== Number(desiredAmount)
@@ -328,6 +377,18 @@ class OrderService {
                 expectedAmount: desiredAmount,
                 correlationId,
               });
+            } else if (
+              providerCheckoutUrl &&
+              providerCheckoutUrl !== existingCheckoutUrl
+            ) {
+              return {
+                order: existingOrder,
+                checkoutUrl: providerCheckoutUrl,
+                returnUrl:
+                  existingOrder.metadata && existingOrder.metadata.returnUrl
+                    ? existingOrder.metadata.returnUrl
+                    : resolveReturnUrl(returnUrl),
+              };
             } else {
               return {
                 order: existingOrder,
@@ -384,11 +445,16 @@ class OrderService {
         existingOrder,
         returnUrl,
         correlationId,
+        {
+          forceRecreate: !isValidCheckoutUrl(existingCheckoutUrl),
+        },
       );
       const finalReturnUrl = paymentResp.returnUrl;
       const nextCheckoutUrl =
-        paymentResp.checkoutUrl ||
-        (existingOrder.metadata && existingOrder.metadata.checkoutUrl) ||
+        normalizeCheckoutUrl(paymentResp.checkoutUrl) ||
+        normalizeCheckoutUrl(
+          existingOrder.metadata && existingOrder.metadata.checkoutUrl,
+        ) ||
         null;
       const nextPaymentId = paymentResp.paymentId || paymentResp.paymentLinkId;
       const nextPaymentAmount =
@@ -437,26 +503,113 @@ class OrderService {
             updatedOrder.metadata &&
             updatedOrder.metadata.checkoutUrl) ||
           nextCheckoutUrl,
+        paymentUrl:
+          (updatedOrder &&
+            updatedOrder.metadata &&
+            updatedOrder.metadata.checkoutUrl) ||
+          nextCheckoutUrl,
         returnUrl: finalReturnUrl,
       };
     };
 
-    // If an order with the same idempotencyKey exists, log it but continue
-    // to create a fresh checkout (force new payment link) to avoid returning
-    // an old/paid checkout. We will not attach the same idempotencyKey to the
-    // new order to avoid duplicate-key conflicts.
+    // If an order with the same idempotencyKey exists, return it instead of
+    // forcing a new checkout. The snapshot is already the same.
     let existingByIdempotency = null;
     if (idempotencyKey) {
       existingByIdempotency = await Order.findOne({ idempotencyKey });
       if (existingByIdempotency) {
-        log("info", "checkout:idempotent-hit-forced-new", {
+        if (
+          ["PAID", "FAILED", "CANCELLED", "COMPLETED", "SUCCESS"].includes(
+            existingByIdempotency.status,
+          )
+        ) {
+          log("info", "checkout:idempotency-terminal-order", {
+            userId,
+            orderId: existingByIdempotency._id.toString(),
+            existingStatus: existingByIdempotency.status,
+            correlationId,
+          });
+          idempotencyKey = `${idempotencyKey}:${Date.now()}`;
+          cartVersion = computeCartVersionFromKey(idempotencyKey);
+          existingByIdempotency = null;
+        }
+      }
+
+      if (existingByIdempotency) {
+        const resolved = await ensureCheckoutUrlForActiveOrder(
+          existingByIdempotency,
+        );
+        let checkoutUrl =
+          normalizeCheckoutUrl(resolved.checkoutUrl) ||
+          normalizeCheckoutUrl(extractCheckoutUrl(existingByIdempotency));
+
+        if (!checkoutUrl) {
+          const paymentResp = await this._createPayment(
+            existingByIdempotency,
+            returnUrl,
+            correlationId,
+            {
+              forceRecreate: true,
+            },
+          );
+          const finalReturnUrl = paymentResp.returnUrl;
+          checkoutUrl =
+            normalizeCheckoutUrl(paymentResp.checkoutUrl) ||
+            normalizeCheckoutUrl(paymentResp.checkout_url) ||
+            normalizeCheckoutUrl(paymentResp.checkoutLink) ||
+            null;
+          const nextPaymentId =
+            paymentResp.paymentId || paymentResp.paymentLinkId;
+          const nextPaymentAmount =
+            typeof paymentResp.amount !== "undefined"
+              ? paymentResp.amount
+              : null;
+
+          const updatedExisting = await Order.findOneAndUpdate(
+            { _id: existingByIdempotency._id },
+            {
+              $set: {
+                paymentId: nextPaymentId,
+                status: "WAITING_PAYMENT",
+                paymentAttemptedAt: new Date(),
+                paymentExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
+                metadata: Object.assign({}, existingByIdempotency.metadata || {}, {
+                  checkoutUrl,
+                  returnUrl: finalReturnUrl,
+                  paymentAmount: nextPaymentAmount,
+                }),
+              },
+            },
+            { new: true },
+          );
+
+          log("info", "checkout:idempotent-resumed", {
+            userId,
+            orderId: existingByIdempotency._id.toString(),
+            correlationId,
+          });
+
+          return {
+            orderId: existingByIdempotency._id.toString(),
+            checkoutUrl,
+            paymentUrl: checkoutUrl,
+            returnUrl: finalReturnUrl,
+            order: updatedExisting || existingByIdempotency,
+          };
+        }
+
+        log("info", "checkout:idempotent-hit", {
           userId,
           orderId: existingByIdempotency._id.toString(),
           correlationId,
         });
-        // Drop idempotencyKey for the new order to force creation of a new
-        // checkout instead of returning the existing one.
-        idempotencyKey = null;
+        return {
+          orderId: existingByIdempotency._id.toString(),
+          checkoutUrl,
+          paymentUrl: checkoutUrl,
+          returnUrl: resolved.returnUrl,
+          order: resolved.order,
+        };
       }
     }
 
@@ -723,18 +876,20 @@ class OrderService {
     let order = null;
     try {
       if (mongoose.Types.ObjectId.isValid(String(orderId))) {
-        order = await Order.findOne({ _id: orderId, userId });
+        const query = { _id: orderId };
+        if (userId) query.userId = userId;
+        order = await Order.findOne(query);
       } else {
         // fallback: match by paymentId, metadata.paymentId, metadata.orderCode, or idempotencyKey
-        order = await Order.findOne({
-          userId,
-          $or: [
-            { paymentId: String(orderId) },
-            { ["metadata.paymentId"]: String(orderId) },
-            { ["metadata.orderCode"]: String(orderId) },
-            { idempotencyKey: String(orderId) },
-          ],
-        });
+        const query = {};
+        if (userId) query.userId = userId;
+        query.$or = [
+          { paymentId: String(orderId) },
+          { ["metadata.paymentId"]: String(orderId) },
+          { ["metadata.orderCode"]: String(orderId) },
+          { idempotencyKey: String(orderId) },
+        ];
+        order = await Order.findOne(query);
       }
     } catch (err) {
       // in case of cast errors or others, fall through to not found
@@ -794,11 +949,92 @@ class OrderService {
   }
 
   async getMyOrders(userId) {
+    const orders = await Order.find({ userId }).sort({ createdAt: -1 }).lean();
+
+    await Promise.all(
+      orders.map(async (order) => {
+        if (order.status === "WAITING_PAYMENT" && order.paymentId) {
+          try {
+            await this.getOrderById(order._id, userId);
+          } catch (error) {}
+        }
+      }),
+    );
+
     return Order.find({ userId }).sort({ createdAt: -1 }).lean();
   }
 
   async getAllOrders() {
     return Order.find({}).sort({ createdAt: -1 }).lean();
+  }
+
+  async applyPaymentResult({ orderId, status, paymentId = null }) {
+    if (!orderId) {
+      const error = new Error("orderId is required");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const normalizedStatus = String(status || "").toUpperCase();
+    if (!normalizedStatus) {
+      const error = new Error("status is required");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const existing = await Order.findById(orderId);
+    if (!existing) {
+      const error = new Error("Order not found");
+      error.statusCode = 404;
+      throw error;
+    }
+
+    if (normalizedStatus === "PAID" || normalizedStatus === "SUCCESS") {
+      if (existing.status === "PAID" || existing.status === "COMPLETED") {
+        return existing;
+      }
+
+      const update = {
+        $set: {
+          status: "PAID",
+        },
+        $inc: { lockVersion: 1 },
+      };
+
+      if (paymentId) {
+        update.$set.paymentId = String(paymentId);
+        update.$set.lastProcessedPaymentId = String(paymentId);
+        update.$addToSet = { processedPaymentIds: String(paymentId) };
+      }
+
+      const updated = await Order.findOneAndUpdate(
+        { _id: orderId, status: { $nin: ["PAID", "COMPLETED"] } },
+        update,
+        { new: true },
+      );
+
+      const finalOrder = updated || (await Order.findById(orderId));
+      try {
+        await this._publishCartClear(finalOrder);
+      } catch (error) {}
+      return finalOrder;
+    }
+
+    if (normalizedStatus === "FAILED" || normalizedStatus === "CANCELLED") {
+      return Order.findOneAndUpdate(
+        { _id: orderId, status: { $nin: ["PAID", "COMPLETED"] } },
+        {
+          $set: {
+            status: "FAILED",
+            ...(paymentId ? { paymentId: String(paymentId) } : {}),
+          },
+          $inc: { lockVersion: 1 },
+        },
+        { new: true },
+      );
+    }
+
+    return existing;
   }
 
   // External payment webhook handling removed from Order Service - handled by Payment Service
@@ -996,6 +1232,130 @@ class OrderService {
       }
     }
     return { expired: toExpire.length };
+  }
+
+  async cleanupStaleWaitingPayments(opts = {}) {
+    const {
+      batchSize = 100,
+      correlationId = null,
+      staleAfterMs = Number(process.env.PAYMENT_STALE_ORDER_MS || 15 * 60 * 1000),
+    } = opts;
+    const now = new Date();
+    const candidates = await Order.find({
+      status: { $in: ["PENDING", "WAITING_PAYMENT"] },
+    })
+      .sort({ createdAt: 1 })
+      .limit(batchSize)
+      .lean();
+
+    let refreshed = 0;
+    let expired = 0;
+
+    for (const order of candidates) {
+      try {
+        const paymentExpiresAt =
+          order.paymentExpiresAt && !Number.isNaN(Date.parse(order.paymentExpiresAt))
+            ? new Date(order.paymentExpiresAt)
+            : null;
+        const createdAt =
+          order.createdAt && !Number.isNaN(Date.parse(order.createdAt))
+            ? new Date(order.createdAt)
+            : now;
+        const isExpired = paymentExpiresAt
+          ? paymentExpiresAt.getTime() <= now.getTime()
+          : now.getTime() - createdAt.getTime() >= staleAfterMs;
+        const isStalePending =
+          order.status === "PENDING" &&
+          now.getTime() - createdAt.getTime() >= staleAfterMs;
+
+        let providerCheckoutUrl = null;
+        let paymentInfo = null;
+
+        if (!isExpired && !isStalePending && order.paymentId) {
+          try {
+            paymentInfo = await getPaymentStatusFromPaymentService(order.paymentId);
+            if (paymentInfo && isValidCheckoutUrl(paymentInfo.checkoutUrl)) {
+              providerCheckoutUrl = String(paymentInfo.checkoutUrl).trim();
+            }
+          } catch (error) {
+            log("warn", "cleanup:payment-lookup-failed", {
+              orderId: order._id.toString(),
+              paymentId: order.paymentId,
+              correlationId,
+              error: error.message,
+            });
+          }
+        }
+
+        if (providerCheckoutUrl && !isStalePending) {
+          const currentCheckoutUrl =
+            order.metadata && typeof order.metadata.checkoutUrl === "string"
+              ? order.metadata.checkoutUrl
+              : null;
+
+          if (currentCheckoutUrl !== providerCheckoutUrl) {
+            await Order.findOneAndUpdate(
+              { _id: order._id, status: "WAITING_PAYMENT" },
+              {
+                $set: {
+                  metadata: Object.assign({}, order.metadata || {}, {
+                    checkoutUrl: providerCheckoutUrl,
+                    paymentAmount:
+                      typeof paymentInfo.amount !== "undefined"
+                        ? paymentInfo.amount
+                        : order.totalPrice,
+                  }),
+                },
+              },
+            );
+            refreshed += 1;
+          }
+          continue;
+        }
+
+        await Order.findOneAndUpdate(
+          { _id: order._id, status: { $in: ["PENDING", "WAITING_PAYMENT"] } },
+          {
+            $set: { status: "FAILED" },
+            $unset: {
+              paymentId: "",
+              paymentExpiresAt: "",
+              metadata: "",
+            },
+            $inc: { lockVersion: 1 },
+          },
+        );
+
+        try {
+          await eventBus.publish("OrderFailed", {
+            orderId: order._id.toString(),
+            paymentId: order.paymentId,
+            correlationId,
+            reason: isExpired || isStalePending ? "payment_expired" : "stale_checkout_link",
+          });
+        } catch (error) {
+          log("warn", "cleanup:event-publish-failed", {
+            orderId: order._id.toString(),
+            error: error.message,
+            correlationId,
+          });
+        }
+        expired += 1;
+      } catch (error) {
+        log("error", "cleanup:error", {
+          orderId: order._id.toString(),
+          error: error.message,
+          correlationId,
+        });
+      }
+    }
+
+    log("info", "cleanup:done", {
+      refreshed,
+      expired,
+      correlationId,
+    });
+    return { refreshed, expired };
   }
 }
 

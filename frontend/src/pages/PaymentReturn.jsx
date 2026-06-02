@@ -1,10 +1,11 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { CheckCircle, XCircle, Loader } from "lucide-react";
 import Navbar from "../components/common/Navbar";
 import Footer from "../components/common/Footer";
 import OrderStatusBadge from "../components/common/OrderStatusBadge";
 import { orderApi } from "../services/api/orderApi";
+import { apiRequest } from "../services/api/client";
 import { usePolling } from "../hooks/usePolling";
 import { useCartStore } from "../store/useCartStore";
 import { formatCurrency } from "../utils/formatCurrency";
@@ -12,8 +13,12 @@ import { formatCurrency } from "../utils/formatCurrency";
 const PaymentReturn = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const orderId =
-    searchParams.get("orderId") ||
+  const orderId = searchParams.get("orderId");
+  const returnStatus = String(searchParams.get("status") || "").toUpperCase();
+  const providerCode = String(searchParams.get("code") || "");
+  const isCancelled = String(searchParams.get("cancel") || "").toLowerCase() === "true";
+
+  const paymentLookupId =
     searchParams.get("orderCode") ||
     searchParams.get("order_code") ||
     searchParams.get("id") ||
@@ -21,14 +26,42 @@ const PaymentReturn = () => {
 
   const [isPolling, setIsPolling] = useState(true);
   const [order, setOrder] = useState(null);
+  const hasConfirmedRef = useRef(false);
+
+  const resolveOrderIdFromPayment = useCallback(async () => {
+    if (!paymentLookupId) return null;
+
+    const response = await apiRequest(
+      `/api/payments/${encodeURIComponent(paymentLookupId)}`,
+    );
+    const result = await response.json();
+
+    if (!response.ok) {
+      throw new Error(result?.message || result?.error || "Payment not found");
+    }
+
+    const payment = result?.data || result;
+    return payment?.orderId || null;
+  }, [paymentLookupId]);
 
   const fetchOrder = useCallback(async () => {
-    if (!orderId) {
+    if (!orderId && !paymentLookupId) {
       setIsPolling(false);
       return null;
     }
     try {
-      const response = await orderApi.getOrder(orderId);
+      let effectiveOrderId = orderId;
+
+      if (!effectiveOrderId && paymentLookupId) {
+        effectiveOrderId = await resolveOrderIdFromPayment();
+      }
+
+      if (!effectiveOrderId) {
+        setIsPolling(false);
+        return null;
+      }
+
+      const response = await orderApi.getOrder(effectiveOrderId);
       const data = response?.data || response;
 
       if (data) {
@@ -46,15 +79,53 @@ const PaymentReturn = () => {
       // Rethrow to let usePolling handle the error
       throw err;
     }
-  }, [orderId]);
+  }, [orderId, paymentLookupId, resolveOrderIdFromPayment]);
 
   const { error } = usePolling(fetchOrder, isPolling, 2000);
 
+  const confirmReturnedPayment = useCallback(async () => {
+    if (!orderId || hasConfirmedRef.current) return;
+
+    const shouldConfirmPaid = returnStatus === "PAID" || providerCode === "00";
+    const shouldConfirmFailed = isCancelled || returnStatus === "CANCELLED";
+
+    if (!shouldConfirmPaid && !shouldConfirmFailed) {
+      return;
+    }
+
+    hasConfirmedRef.current = true;
+    const normalizedStatus = shouldConfirmPaid ? "PAID" : "FAILED";
+
+    try {
+      const response = await orderApi.confirmPaymentReturn(orderId, {
+        status: normalizedStatus,
+        paymentLookupId,
+        paymentId: paymentLookupId,
+      });
+      const data = response?.data || response;
+      if (data) {
+        setOrder(data);
+        if (data.status === "PAID") {
+          useCartStore.getState().clearCart();
+        }
+        if (data.status === "PAID" || data.status === "FAILED") {
+          setIsPolling(false);
+        }
+      }
+    } catch (confirmError) {
+      hasConfirmedRef.current = false;
+    }
+  }, [isCancelled, orderId, paymentLookupId, providerCode, returnStatus]);
+
   useEffect(() => {
-    if (!orderId) {
+    if (!orderId && !paymentLookupId) {
       setIsPolling(false);
     }
-  }, [orderId]);
+  }, [orderId, paymentLookupId]);
+
+  useEffect(() => {
+    confirmReturnedPayment();
+  }, [confirmReturnedPayment]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -72,7 +143,7 @@ const PaymentReturn = () => {
     setTimeout(() => setIsPolling(true), 100);
   };
 
-  if (!orderId) {
+  if (!orderId && !paymentLookupId) {
     return (
       <div className="bg-[#f5f5f7] min-h-screen flex flex-col">
         <Navbar />

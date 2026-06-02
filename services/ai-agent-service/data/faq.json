@@ -1,0 +1,27 @@
+[
+  {
+    "title": "Chính sách bảo hành",
+    "keywords": ["bảo hành", "warranty", "hành"],
+    "answer": "Sản phẩm ELPPA được bảo hành theo chính sách của hãng và nhà phân phối. Thời gian và phạm vi bảo hành phụ thuộc từng dòng sản phẩm và trạng thái sản phẩm khi mua."
+  },
+  {
+    "title": "Chính sách đổi trả",
+    "keywords": ["đổi trả", "return", "hoàn tiền", "trả hàng"],
+    "answer": "Bạn có thể đổi trả trong thời gian quy định nếu sản phẩm còn đầy đủ phụ kiện, hóa đơn và đáp ứng điều kiện đổi trả của cửa hàng."
+  },
+  {
+    "title": "Hình thức thanh toán",
+    "keywords": ["thanh toán", "pay", "payment", "cod", "chuyển khoản"],
+    "answer": "ELPPA hỗ trợ thanh toán tiền mặt khi nhận hàng, chuyển khoản và các phương thức thanh toán điện tử được tích hợp trong hệ thống."
+  },
+  {
+    "title": "Giao hàng",
+    "keywords": ["giao hàng", "shipping", "vận chuyển", "ship"],
+    "answer": "Thời gian giao hàng phụ thuộc khu vực nhận hàng và trạng thái tồn kho. Đơn hàng sẽ được cập nhật tiến trình qua hệ thống đặt hàng."
+  },
+  {
+    "title": "Hủy đơn hàng",
+    "keywords": ["hủy đơn", "cancel", "đơn hàng"],
+    "answer": "Bạn có thể yêu cầu hủy đơn trước khi đơn được xác nhận hoặc bàn giao cho đơn vị vận chuyển."
+  }
+]

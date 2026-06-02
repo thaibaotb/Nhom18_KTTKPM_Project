@@ -77,4 +77,4 @@ async function outboxStats(req, res, next) {
   }
 }
 
-module.exports = { listOutbox, retryOutbox, outboxStats };
+module.exports = { listOutbox, retryOutbox, retryAll, outboxStats };

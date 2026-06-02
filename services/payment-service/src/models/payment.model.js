@@ -11,6 +11,7 @@ const paymentSchema = new mongoose.Schema(
       index: true,
     },
     paymentLinkId: { type: String, index: true, sparse: true },
+    orderCode: { type: String, index: true, sparse: true },
     transactionId: { type: String, index: true, sparse: true },
     provider: { type: String, default: "PAYOS" },
     checkoutUrl: { type: String },

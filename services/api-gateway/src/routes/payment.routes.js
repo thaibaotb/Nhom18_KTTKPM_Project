@@ -5,6 +5,7 @@ const {
 
 const proxyToPayment = createPaymentProxyMiddleware();
 
+router.get("/payments/:id", proxyToPayment);
 router.post("/payments", proxyToPayment);
 router.post("/payments/webhook", proxyToPayment);
 

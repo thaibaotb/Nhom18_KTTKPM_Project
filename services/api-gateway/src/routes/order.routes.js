@@ -28,6 +28,8 @@ router.delete("/cart/clear", authMiddleware(["user", "admin"]), proxyToCart);
 // Order routes - pass token through without verifying at gateway level
 // order-service's own userFromHeader middleware reads X-User-Payload
 router.post("/checkout", proxyToOrder);
+router.post("/orders", proxyToOrder);
+router.post("/orders/:id/confirm-payment-return", proxyToOrder);
 router.get("/orders", authMiddleware(["admin"]), proxyToOrder);
 router.get("/orders/me", proxyToOrder);
 router.get("/orders/:id", proxyToOrder);

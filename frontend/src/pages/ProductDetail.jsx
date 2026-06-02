@@ -16,6 +16,7 @@ import Footer from "../components/common/Footer";
 import axios from "axios";
 import MinimalProductCard from "../components/category/MinimalProductCard";
 import { apiRequest } from "../services/api/client";
+import { orderApi } from "../services/api/orderApi";
 import { useAuthStore } from "../store/useAuthStore";
 import { useCartStore } from "../store/useCartStore";
 import { toast } from "../store/useToastStore";

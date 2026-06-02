@@ -19,6 +19,22 @@ function isTerminalPaymentStatus(status) {
   return ["PAID", "FAILED"].includes(String(status || "").toUpperCase());
 }
 
+function isValidPayosCheckoutUrl(checkoutUrl) {
+  return (
+    typeof checkoutUrl === "string" &&
+    /^https:\/\/pay\.payos\.vn\/web\/[a-f0-9]{32}\/??$/i.test(
+      checkoutUrl.trim(),
+    )
+  );
+}
+
+function isValidPayosLinkId(paymentLinkId) {
+  return (
+    typeof paymentLinkId === "string" &&
+    /^[a-f0-9]{32}$/i.test(paymentLinkId.trim())
+  );
+}
+
 async function retryWithBackoff(fn, attempts = 2) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -40,7 +56,15 @@ class PaymentService {
     this.inFlightCreates = new Map();
   }
 
-  async createPayment({ orderId, amount, description }) {
+  async createPayment({
+    orderId,
+    amount,
+    description,
+    orderCode,
+    returnUrl,
+    cancelUrl,
+    forceRecreate = false,
+  }) {
     if (!orderId || !String(orderId).trim()) {
       throw badRequest("orderId is required");
     }
@@ -50,17 +74,32 @@ class PaymentService {
     if (typeof description !== "undefined" && typeof description !== "string") {
       throw badRequest("description must be a string");
     }
+    if (typeof returnUrl !== "undefined" && typeof returnUrl !== "string") {
+      throw badRequest("returnUrl must be a string");
+    }
+    if (typeof cancelUrl !== "undefined" && typeof cancelUrl !== "string") {
+      throw badRequest("cancelUrl must be a string");
+    }
 
     const normalizedOrderId = String(orderId).trim();
     const normalizedAmount = Number(amount);
     const normalizedDescription = String(
       description || `Order ${normalizedOrderId}`,
-    );
+    )
+      .trim()
+      .slice(0, 25);
+    const recreateRequested = Boolean(forceRecreate);
 
-    const existing = await this.paymentModel.findOne({
-      orderId: normalizedOrderId,
-    });
-    if (existing) {
+    const existing = recreateRequested
+      ? null
+      : await this.paymentModel.findOne({
+          orderId: normalizedOrderId,
+        });
+    if (
+      existing &&
+      isValidPayosCheckoutUrl(existing.checkoutUrl) &&
+      isValidPayosLinkId(existing.paymentLinkId)
+    ) {
       logPaymentEvent("PAYMENT_CREATED", {
         orderId: normalizedOrderId,
         amount: existing.amount,
@@ -77,20 +116,41 @@ class PaymentService {
       orderId: normalizedOrderId,
       amount: normalizedAmount,
       description: normalizedDescription,
+      orderCode: Number.isFinite(Number(orderCode)) ? Number(orderCode) : null,
+      returnUrl: typeof returnUrl === "string" ? returnUrl.trim() : null,
+      cancelUrl: typeof cancelUrl === "string" ? cancelUrl.trim() : null,
+      forceRecreate: recreateRequested,
     });
-    this.inFlightCreates.set(normalizedOrderId, createPromise);
+    const inFlightKey = recreateRequested
+      ? `${normalizedOrderId}:force:${Date.now()}`
+      : normalizedOrderId;
+    this.inFlightCreates.set(inFlightKey, createPromise);
 
     try {
       return await createPromise;
     } finally {
-      this.inFlightCreates.delete(normalizedOrderId);
+      this.inFlightCreates.delete(inFlightKey);
     }
   }
 
-  async _createPaymentInternal({ orderId, amount, description }) {
-    const existing = await this.paymentModel.findOne({ orderId });
-    if (existing) {
-      return existing;
+  async _createPaymentInternal({
+    orderId,
+    amount,
+    description,
+    orderCode = null,
+    returnUrl = null,
+    cancelUrl = null,
+    forceRecreate = false,
+  }) {
+    if (!forceRecreate) {
+      const existing = await this.paymentModel.findOne({ orderId });
+      if (
+        existing &&
+        isValidPayosCheckoutUrl(existing.checkoutUrl) &&
+        isValidPayosLinkId(existing.paymentLinkId)
+      ) {
+        return existing;
+      }
     }
 
     try {
@@ -98,15 +158,24 @@ class PaymentService {
         orderId,
         amount,
         description,
+        orderCode,
+        returnUrl,
+        cancelUrl,
       });
-      const payment = await this.paymentModel.create({
-        orderId,
-        amount,
-        status: "PENDING",
-        provider: "PAYOS",
-        paymentLinkId: providerResponse.paymentLinkId,
-        checkoutUrl: providerResponse.checkoutUrl,
-      });
+      const payment = await this.paymentModel.findOneAndUpdate(
+        { orderId },
+        {
+          $set: {
+            orderCode: providerResponse.orderCode || orderId,
+            amount,
+            status: "PENDING",
+            provider: "PAYOS",
+            paymentLinkId: providerResponse.paymentLinkId,
+            checkoutUrl: providerResponse.checkoutUrl,
+          },
+        },
+        { new: true, upsert: true },
+      );
 
       logPaymentEvent("PAYMENT_CREATED", {
         orderId,
@@ -168,7 +237,12 @@ class PaymentService {
     const paymentLinkId = orderCode;
 
     const payment = await this.paymentModel.findOne({
-      $or: [{ paymentLinkId }, { orderId: paymentLinkId }, { transactionId }],
+      $or: [
+        { paymentLinkId },
+        { orderCode: String(orderCode) },
+        { orderId: paymentLinkId },
+        { transactionId },
+      ],
     });
     if (!payment) {
       console.log("[PAYMENT_SERVICE] [WEBHOOK] [IGNORED] payment not found", {
@@ -337,15 +411,22 @@ class PaymentService {
 
   async getPayment(id) {
     if (!id) return null;
+    const queryValue = String(id);
+    const lookup = {
+      $or: [
+        { orderId: queryValue },
+        { orderCode: queryValue },
+        { paymentLinkId: queryValue },
+        { transactionId: queryValue },
+      ],
+    };
+
+    if (this.paymentModel?.base?.Types?.ObjectId?.isValid?.(queryValue)) {
+      lookup.$or.push({ _id: queryValue });
+    }
+
     const payment = await this.paymentModel
-      .findOne({
-        $or: [
-          { orderId: String(id) },
-          { paymentLinkId: String(id) },
-          { transactionId: String(id) },
-          { _id: id },
-        ],
-      })
+      .findOne(lookup)
       .lean();
     return payment;
   }

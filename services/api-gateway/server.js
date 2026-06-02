@@ -11,6 +11,7 @@ const healthRoutes = require("./src/routes/health.routes");
 const authRoutes = require("./src/routes/auth.routes");
 const productRoutes = require("./src/routes/product.routes");
 const categoryRoutes = require("./src/routes/category.routes");
+const aiRoutes = require("./src/routes/ai.routes");
 const chatRoutes = require("./src/routes/chat.routes");
 const orderRoutes = require("./src/routes/order.routes");
 const paymentRoutes = require("./src/routes/payment.routes");
@@ -33,7 +34,7 @@ app.use(
 
 // --- Rate Limiters ---
 
-/*
+
 // Strict limiter for authentication (login/register)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -48,24 +49,24 @@ const authLimiter = rateLimit({
   }
 });
 
-// Normal limiter for general API routes
-const defaultLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  keyGenerator: (req) => {
-    // Identity-based rate limiting (UserId + IP)
-    return req.user ? `${req.user.id}-${req.ip}` : req.ip;
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    message: 'Too many requests, please slow down',
-    data: null,
-    errorCode: 'RATE_LIMIT_EXCEEDED'
-  }
-});
-*/
+// // Normal limiter for general API routes
+// const defaultLimiter = rateLimit({
+//   windowMs: 15 * 60 * 1000,
+//   max: 100,
+//   keyGenerator: (req) => {
+//     // Identity-based rate limiting (UserId + IP)
+//     return req.user ? `${req.user.id}-${req.ip}` : req.ip;
+//   },
+//   standardHeaders: true,
+//   legacyHeaders: false,
+//   message: {
+//     success: false,
+//     message: 'Too many requests, please slow down',
+//     data: null,
+//     errorCode: 'RATE_LIMIT_EXCEEDED'
+//   }
+// });
+
 
 // --- Middlewares & Routes ---
 
@@ -73,10 +74,11 @@ app.use(correlationMiddleware);
 app.use(loggerMiddleware);
 
 // app.use('/api/auth', authLimiter, authRoutes);
-app.use("/api/auth", authRoutes);
+app.use("/api/auth", authLimiter,authRoutes);
 
 app.use("/api/products", productRoutes);
 app.use("/api/categories", categoryRoutes);
+app.use("/api/ai", aiRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api", orderRoutes);
 app.use("/api", paymentRoutes);

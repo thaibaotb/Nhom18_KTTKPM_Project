@@ -4,6 +4,7 @@ const bodyParser = require("body-parser");
 const { port } = require("./src/config/env");
 const connectDb = require("./src/config/db");
 const orderRoutes = require("./src/routes/order.routes");
+const orderService = require("./src/services/order.service");
 const errorHandler = require("./src/middlewares/errorHandler");
 
 const app = express();
@@ -40,7 +41,14 @@ app.use("/orders", orderRoutes);
 app.use(errorHandler);
 
 connectDb()
-  .then(() => {
+  .then(async () => {
+    try {
+      await orderService.cleanupStaleWaitingPayments({ batchSize: 500 });
+      await orderService.expirePendingPayments({ batchSize: 500 });
+    } catch (error) {
+      console.error("Order cleanup failed", error);
+    }
+
     app.listen(port, () => console.log(`Order Service listening on ${port}`));
   })
   .catch((err) => {

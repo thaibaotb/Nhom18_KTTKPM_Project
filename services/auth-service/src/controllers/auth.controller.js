@@ -126,6 +126,35 @@ async function getUsers(req, res, next) {
   }
 }
 
+async function updateUserRole(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+    const user = await authService.updateUserRole(req.user, id, role);
+    return res.status(200).json({
+      success: true,
+      message: 'Cập nhật role thành công',
+      data: user
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function deleteUser(req, res, next) {
+  try {
+    const { id } = req.params;
+    const result = await authService.deleteUser(req.user, id);
+    return res.status(200).json({
+      success: true,
+      message: 'Xóa tài khoản thành công',
+      data: result
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   register,
   login,
@@ -135,5 +164,7 @@ module.exports = {
   verifyOTP,
   verifyRegistration,
   updateMe,
-  getUsers
+  getUsers,
+  updateUserRole,
+  deleteUser
 };
